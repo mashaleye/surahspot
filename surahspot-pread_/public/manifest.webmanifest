@@ -1,0 +1,19 @@
+{
+  "name": "SurahSpot",
+  "short_name": "SurahSpot",
+  "description": "Listen to a complete ayah and identify its Surah in five tries across a seven-round attempt.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#f5f3ec",
+  "theme_color": "#f5f3ec",
+  "categories": ["education", "games"],
+  "icons": [
+    {
+      "src": "/brand/surahspot-mark.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

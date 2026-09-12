@@ -1,0 +1,25 @@
+# Keep the build context small and, more importantly, keep secrets out of it.
+# Anything copied into a layer is recoverable from the image even if a later
+# layer deletes it.
+.env
+.env.*
+!.env.example
+
+node_modules
+.next
+out
+coverage
+playwright-report
+test-results
+
+.git
+.github
+.vscode
+.idea
+*.log
+.DS_Store
+Dockerfile
+docker-compose.yml
+README.md
+docs
+tsconfig.tsbuildinfo

@@ -1,0 +1,17 @@
+node_modules
+.next
+out
+
+# Never commit real credentials. .env.example is the tracked template.
+.env
+.env.*
+!.env.local
+
+coverage
+playwright-report
+test-results
+.playwright
+
+*.log
+.DS_Store
+tsconfig.tsbuildinfo

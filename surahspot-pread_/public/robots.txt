@@ -1,0 +1,5 @@
+# SurahSpot serves no indexable content: every round URL is the same page and
+# API responses carry the answer. Keep crawlers off entirely so they neither
+# consume Quran Foundation quota nor cache a round payload.
+User-agent: *
+Disallow: /

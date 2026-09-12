@@ -1,0 +1,218 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run on the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Every job runs against the fixture upstream. No Quran Foundation
+  # credentials are needed, no quota is consumed, and forked pull requests get
+  # the same coverage as internal ones — which would be impossible if CI
+  # depended on secrets.
+  QF_MOCK: "1"
+  QF_ENV: prelive
+  QF_CLIENT_ID: ci-client
+  QF_CLIENT_SECRET: ci-secret
+  ROUND_TOKEN_SECRET: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  verify:
+    name: Typecheck, lint, unit tests
+    runs-on: ubuntu-latest
+
+    # A real Redis so the store contract suite runs against both backends. The
+    # suite skips the Redis cases when none is reachable, and a skip that
+    # becomes permanent is how an untested backend ships.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Vendor the Quranic font
+        run: npm run fetch:font
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit and integration tests
+        run: npm run test -- --coverage
+        env:
+          TEST_REDIS_URL: redis://127.0.0.1:6390
+
+      # A silent skip here would mean the Redis backend is never exercised.
+      - name: Confirm the Redis contract suite actually ran
+        run: |
+          npx vitest run tests/integration/store.test.ts --reporter=json --outputFile=/tmp/store.json
+          node -e "
+            const r = require('/tmp/store.json');
+            const skipped = r.testResults.flatMap(f => f.assertionResults).filter(a => a.status === 'pending');
+            if (skipped.length) {
+              console.error('Redis contract tests were skipped — no server was reachable.');
+              process.exit(1);
+            }
+            console.log('Redis contract tests ran.');
+          "
+        env:
+          TEST_REDIS_URL: redis://127.0.0.1:6390
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+
+  build:
+    name: Production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run fetch:font
+
+      - name: Build
+        run: npm run build
+
+      # Catches a standalone output that builds but cannot start — a missing
+      # traced dependency, for instance, which `next build` reports as success.
+      # QF_MOCK is deliberately NOT set here: the fixture upstream is refused
+      # when NODE_ENV=production, and this step is checking that the production
+      # server starts and answers liveness, not that it can build a round.
+      - name: Verify the standalone server boots
+        env:
+          QF_MOCK: "0"
+          PORT: "3000"
+          HOSTNAME: 127.0.0.1
+        run: |
+          cp -r .next/static .next/standalone/.next/static
+          cp -r public .next/standalone/public
+          node .next/standalone/server.js &
+          SERVER_PID=$!
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/api/health > /dev/null; then
+              echo "Server is up."
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3000/api/health | tee /dev/stderr | grep -q '"status":"ok"'
+          kill $SERVER_PID
+
+  e2e:
+    name: End-to-end (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # WebKit is not optional: mobile Safari is where this app's media
+        # behaviour diverges, and it is the browser desktop Chrome will never
+        # stand in for.
+        project: [chromium, webkit, mobile-safari]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install browsers
+        run: npx playwright install --with-deps chromium webkit
+
+      - run: npm run fetch:font
+      - run: npm run build
+
+      - name: Run end-to-end tests
+        run: npx playwright test --project=${{ matrix.project }}
+        env:
+          # `next start` runs with NODE_ENV=production. Both acknowledgements
+          # are accurate for this harness: one process, fixture upstream.
+          ALLOW_SINGLE_INSTANCE_STORE: "1"
+          QF_MOCK_ACK_PRODUCTION_BUILD: "1"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report-${{ matrix.project }}
+          path: playwright-report/
+          retention-days: 7
+
+  docker:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: surahspot:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start the container and check health
+        run: |
+          # ALLOW_SINGLE_INSTANCE_STORE=1 because this smoke check is one
+          # container with no Redis. Production refuses the in-memory store
+          # without that acknowledgement, which is the behaviour being relied
+          # on here rather than worked around.
+          docker run -d --name surahspot -p 3000:3000 \
+            -e QF_MOCK=0 \
+            -e QF_ENV=prelive \
+            -e QF_CLIENT_ID=ci-client \
+            -e QF_CLIENT_SECRET=ci-secret \
+            -e ROUND_TOKEN_SECRET=$ROUND_TOKEN_SECRET \
+            -e ALLOW_SINGLE_INSTANCE_STORE=1 \
+            surahspot:ci
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/api/health > /dev/null; then break; fi
+            sleep 2
+          done
+          # Liveness only. A deep check would call Quran Foundation with
+          # placeholder credentials and fail for the wrong reason.
+          curl -fsS http://127.0.0.1:3000/api/health | grep -q '"status":"ok"'
+          docker logs surahspot
+          docker rm -f surahspot

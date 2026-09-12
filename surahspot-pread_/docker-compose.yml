@@ -1,0 +1,45 @@
+# Local approximation of a production deployment.
+#
+# This is the reference deployment shape: app + shared store. Redis is not an
+# optional extra here — production refuses to start without a shared store
+# unless ALLOW_SINGLE_INSTANCE_STORE=1 is set, because the two-hint limit and
+# the round-replay guard stop holding across replicas and do so silently.
+#
+# It is also the only way to exercise that path locally. `npm run dev` cannot
+# show you whether those rules survive more than one process.
+
+services:
+  app:
+    build:
+      context: .
+      target: runner
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      QF_ENV: ${QF_ENV:-prelive}
+      QF_CLIENT_ID: ${QF_CLIENT_ID:?set QF_CLIENT_ID in .env.local or your shell}
+      QF_CLIENT_SECRET: ${QF_CLIENT_SECRET:?set QF_CLIENT_SECRET}
+      ROUND_TOKEN_SECRET: ${ROUND_TOKEN_SECRET:?generate with openssl rand -hex 32}
+      ATTEMPT_STORE_URL: redis://redis:6379
+      RATE_LIMIT_ENABLED: "true"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # appendonly so attempts survive a restart of this container. Losing them
+    # would reset every in-flight attempt's hint allowance.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:
